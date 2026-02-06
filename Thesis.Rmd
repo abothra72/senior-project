@@ -14,13 +14,16 @@ This is an R Markdown document. Markdown is a simple formatting syntax for autho
 
 When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
 
-## Including Plots
-
+## Data Loading and Cleaning
 ```{r}
 library(dplyr)
+library(lubridate)
+library(leaflet)
 
-inspections <- read.csv("Chicago-Food-Inspections.csv")
-neighborhoods <- read.csv("Chicago-Neighborhoods.csv")
+
+
+inspections <- read.csv("data/Chicago-Food-Inspections.csv")
+neighborhoods <- read.csv("data/Chicago-Neighborhoods.csv")
 
 
 table(inspections$Results)
@@ -30,7 +33,137 @@ table(inspections$Inspection.Type)
 inspections <- inspections %>%
   filter(Results %in% c("Pass", "Pass w/ Conditions", "Fail"),
          Inspection.Type %in% c("Canvass", "Canvass Re-Inspection", 
-                                "License", "License Re-Inspection"))
+                                "License", "License Re-Inspection"),
+         Facility.Type %in% c("Restaurant", "Grocery Store", 
+                               "School", "Bakery", 
+                               "Daycare (2 - 6 Years)",
+                              "Children's Services Facility",
+                              "Hospital Cafeteria"))
 
+inspections <- inspections %>%
+  mutate(Year = year(mdy(Inspection.Date)),
+         Month = month(mdy(Inspection.Date))) 
+```
+
+# 2024 Leaflet Map of Inspections
+```{r}
+inspections_recent <- inspections %>%
+  filter(Year == 2024)
+
+color_pal <- colorFactor(
+  palette = c("red", "green", "yellow"),  
+  domain = c("Fail", "Pass", "Pass w/ Conditions"))
+
+map <- leaflet(inspections_recent) %>%
+  addTiles() %>%  # Add default OpenStreetMap tiles
+  addCircleMarkers(
+    lng = ~Longitude,
+    lat = ~Latitude,
+    color = ~color_pal(Results),
+    fillOpacity = 0.7,
+    radius = 5,
+    popup = ~paste(
+      "<b>", AKA.Name, "</b>",
+      "<br>Result:", Results,
+      "<br>Date:", Inspection.Date,
+      "<br>Facility Type:", Facility.Type,
+      "<br>Zip Code:", Zip,
+      "<br>Risk:", Risk)) %>%
+  addLegend(
+    position = "bottomright",
+    pal = color_pal,
+    values = ~Results,
+    title = "Inspection Result")
+
+map
+```
+
+# Proportion of Failed Inspections Over Time for Top 5 Worst and Best Zip Codes in 2010
+```{r}
+# Calculate failure rate for each zip in 2010
+zip_2010 <- inspections %>%
+  filter(Year == 2010) %>%
+  group_by(Zip) %>%
+  summarize(
+    total = n(),
+    failures = sum(Results == "Fail"),
+    fail_prop = failures / total,
+    .groups = "drop") %>%
+  filter(fail_prop > 0) %>%  # Only keep zips with at least some failures
+  arrange(desc(fail_prop))
+
+# Get top 5 worst and top 5 best zip codes
+worst_5 <- head(zip_2010, 5)$Zip
+best_5 <- tail(zip_2010, 5)$Zip
+selected_zips <- c(worst_5, best_5)
+
+# Calculate failure proportions over time for selected zips
+failure_props <- inspections %>%
+  filter(Zip %in% selected_zips, Year <= 2025) %>%  # Filter to 2025 and earlier
+  group_by(Zip, Year) %>%
+  summarize(
+    total = n(),
+    failures = sum(Results == "Fail"),
+    fail_prop = failures / total,
+    .groups = "drop")
+
+# Create the plot
+ggplot(failure_props, aes(x = Year, y = fail_prop, color = as.factor(Zip))) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "Proportion of Failed Inspections: Top 5 Worst vs Best Zip Codes (Based on 2010)",
+    x = "Year",
+    y = "Proportion of Failures",
+    color = "Zip Code") +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::percent)
+```
+
+# Monthly Proportions of Failures Over Time
+```{r}
+# Calculate failure proportions by month and year
+failure_by_month <- inspections %>%
+  filter(Year >= 2010, Year <= 2025) %>%
+  group_by(Year, Month) %>%
+  summarize(
+    total = n(),
+    failures = sum(Results == "Fail"),
+    fail_prop = failures / total,
+    .groups = "drop")
+
+ggplot(failure_by_month, aes(x = Year, y = fail_prop, color = as.factor(Month), group = Month)) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "Proportion of Failed Inspections by Month (2010-2025)",
+    x = "Year",
+    y = "Proportion of Failures",
+    color = "Month") +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::percent)
+```
+
+# Worst and Best Months by Year
+```{r}
+# Get top 2 and bottom 2 months for each year
+monthly_extremes <- failure_by_month %>%
+  group_by(Year) %>%
+  arrange(Year, desc(fail_prop)) %>%
+  mutate(rank = row_number()) %>%
+  filter(rank <= 2 | rank >= (n() - 1)) %>%
+  mutate(category = ifelse(rank <= 2, "Highest", "Lowest")) %>%
+  select(Year, Month, fail_prop, category) %>%
+  arrange(Year, category, desc(fail_prop))
+
+monthly_extremes_wide <- monthly_extremes %>%
+  group_by(Year, category) %>%
+  mutate(rank_within = row_number()) %>%
+  unite("Month_Prop", Month, fail_prop, sep = " (") %>%
+  mutate(Month_Prop = paste0(Month_Prop, ")")) %>%
+  pivot_wider(
+    names_from = c(category, rank_within),
+    values_from = Month_Prop,
+    names_sep = "_")
+
+monthly_extremes_wide
 ```
 
