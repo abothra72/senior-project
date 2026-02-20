@@ -19,16 +19,12 @@ When you click the **Knit** button a document will be generated that includes bo
 library(dplyr)
 library(lubridate)
 library(leaflet)
-
-
+library(sf)
+library(stringr)
+library(tidyr)
+library(ggplot2)
 
 inspections <- read.csv("data/Chicago-Food-Inspections.csv")
-neighborhoods <- read.csv("data/Chicago-Neighborhoods.csv")
-
-
-table(inspections$Results)
-table(inspections$Facility.Type)
-table(inspections$Inspection.Type)
 
 inspections <- inspections %>%
   filter(Results %in% c("Pass", "Pass w/ Conditions", "Fail"),
@@ -42,7 +38,13 @@ inspections <- inspections %>%
 
 inspections <- inspections %>%
   mutate(Year = year(mdy(Inspection.Date)),
-         Month = month(mdy(Inspection.Date))) 
+         Month = month(mdy(Inspection.Date)),
+         Day = day(mdy(Inspection.Date))) 
+
+inspections <- inspections %>%
+  rename(License = License..)
+
+inspections <- inspections[inspections$License > 0,]
 ```
 
 # 2024 Leaflet Map of Inspections
@@ -55,7 +57,7 @@ color_pal <- colorFactor(
   domain = c("Fail", "Pass", "Pass w/ Conditions"))
 
 map <- leaflet(inspections_recent) %>%
-  addTiles() %>%  # Add default OpenStreetMap tiles
+  addTiles() %>% 
   addCircleMarkers(
     lng = ~Longitude,
     lat = ~Latitude,
@@ -89,7 +91,7 @@ zip_2010 <- inspections %>%
     failures = sum(Results == "Fail"),
     fail_prop = failures / total,
     .groups = "drop") %>%
-  filter(fail_prop > 0) %>%  # Only keep zips with at least some failures
+  filter(fail_prop > 0) %>%  
   arrange(desc(fail_prop))
 
 # Get top 5 worst and top 5 best zip codes
@@ -99,7 +101,7 @@ selected_zips <- c(worst_5, best_5)
 
 # Calculate failure proportions over time for selected zips
 failure_props <- inspections %>%
-  filter(Zip %in% selected_zips, Year <= 2025) %>%  # Filter to 2025 and earlier
+  filter(Zip %in% selected_zips, Year <= 2025) %>%  
   group_by(Zip, Year) %>%
   summarize(
     total = n(),
@@ -167,3 +169,455 @@ monthly_extremes_wide <- monthly_extremes %>%
 monthly_extremes_wide
 ```
 
+# Joining Community Area Data
+```{r}
+neighborhoods <- read.csv("data/CA-Boundaries.csv")
+
+# Convert neighborhoods to sf object
+neighborhoods_sf <- st_as_sf(neighborhoods, wkt = "the_geom", crs = 4326)
+
+# Filter out rows with missing coordinates
+inspections_clean <- inspections %>%
+  filter(!is.na(Longitude) & !is.na(Latitude))
+
+# Convert inspections to sf object (points)
+inspections_sf <- st_as_sf(
+  inspections_clean,
+  coords = c("Longitude", "Latitude"),
+  crs = 4326)
+
+# Perform spatial join - match each point to its containing polygon
+inspections_with_community <- st_join(inspections_sf, neighborhoods_sf, join = st_within)
+
+# Convert back to regular dataframe with lat/lon columns
+inspections_with_community <- inspections_with_community %>%
+  mutate(
+    longitude = st_coordinates(.)[,1],
+    latitude = st_coordinates(.)[,2]) %>%
+  st_drop_geometry()  
+```
+
+# Proportion of Failures by Community Area
+```{r}
+community_failure <- inspections_with_community %>%
+  group_by(COMMUNITY) %>%
+  summarize(
+    total = n(),
+    failures = sum(Results == "Fail"),
+    fail_prop = failures / total,
+    .groups = "drop") %>%
+  arrange(desc(fail_prop))
+
+community_failure
+```
+
+# Adding in Racial Data by Community Area per Year
+```{r}
+racial_data <- read.csv("data/CA-Race.csv", check.names = FALSE)
+
+# Pivot longer and clean up
+racial_long <- racial_data %>%
+  mutate(Neighborhood = str_trim(Neighborhood),  
+    Race = str_trim(Race)) %>%
+  pivot_longer(
+    cols = matches("^\\d{4}$"),  
+    names_to = "Year",
+    values_to = "population") %>%
+  mutate(
+    Year = as.numeric(Year),
+    population = as.numeric(gsub(",", "", population)))
+
+# Calculate proportions by neighborhood and year
+racial_props <- racial_long %>%
+  group_by(Neighborhood, Year) %>%
+  mutate(total_pop = population[Race == "Total"][1]) %>%
+  ungroup() %>%
+  filter(Race != "Total", !is.na(total_pop)) %>% 
+  mutate(prop = population / total_pop)
+
+# Pivot wider so each race is a column
+racial_wide <- racial_props %>%
+  select(Neighborhood, Year, Race, prop) %>%
+  pivot_wider(
+    names_from = Race,
+    values_from = prop,
+    names_prefix = "prop_") %>%
+  mutate(Neighborhood = toupper(Neighborhood))  
+
+# Now join with your inspections data
+inspections_with_demographics <- inspections_with_community %>%
+  left_join(
+    racial_wide,
+    by = c("COMMUNITY" = "Neighborhood", "Year" = "Year"))
+```
+# Adding in Citizenship Data by Community Area per Year
+```{r}
+citizenship_data <- read.csv("data/CA-Citizenship.csv", check.names = FALSE)
+
+# Pivot longer and clean up
+citizenship_long <- citizenship_data %>%
+  mutate(
+    Neighborhood = str_trim(Neighborhood),
+    Race = str_trim(Race)) %>%
+  pivot_longer(
+    cols = matches("^\\d{4}$"),
+    names_to = "Year",
+    values_to = "value") %>%
+  mutate(
+    Year = as.numeric(Year),
+    value = as.numeric(gsub(",", "", value)))
+
+# Filter to only the "Percent foreign born" rows
+foreign_born <- citizenship_long %>%
+  filter(Race == "Percent foreign born") %>%
+  select(Neighborhood, Year, pct_foreign_born = value) %>%
+  mutate(Neighborhood = toupper(Neighborhood))
+
+# Join with inspections data
+inspections_with_demographics <- inspections_with_demographics %>%
+  left_join(
+    foreign_born,
+    by = c("COMMUNITY" = "Neighborhood", "Year" = "Year"))
+```
+
+# Adding in Education Data by Community Area per Year
+```{r}
+education_data <- read.csv("data/CA-Education.csv", check.names = FALSE)
+
+# Pivot longer and clean up
+education_long <- education_data %>%
+  mutate(
+    Neighborhood = str_trim(Neighborhood),
+    Education = str_trim(Education)) %>%
+  pivot_longer(
+    cols = matches("^\\d{4}$"),
+    names_to = "Year",
+    values_to = "population") %>%
+  mutate(
+    Year = as.numeric(Year),
+    population = as.numeric(gsub(",", "", as.character(population)))) %>%
+  filter(!is.na(population)) 
+
+# Calculate proportions by neighborhood and year
+education_props <- education_long %>%
+  filter(!grepl("Percent", Education)) %>%  
+  group_by(Neighborhood, Year) %>%
+  summarize(
+    total_pop = sum(population[Education == "Total"], na.rm = TRUE),
+    no_hs = sum(population[Education == "Not HS Graduate"], na.rm = TRUE),
+    hs_only = sum(population[Education == "High School Graduate Only"], na.rm = TRUE),
+    some_college = sum(population[Education == "Some College"], na.rm = TRUE),
+    ba_or_higher = sum(population[Education == "BA or Higher"], na.rm = TRUE),
+    .groups = "drop") %>%
+  filter(total_pop > 0) %>%
+  mutate(
+    prop_edu_no_hs = no_hs / total_pop,
+    prop_edu_hs_only = hs_only / total_pop,
+    prop_edu_some_college = some_college / total_pop,
+    prop_edu_ba_or_higher = ba_or_higher / total_pop,
+    Neighborhood = toupper(Neighborhood)) %>%
+  select(Neighborhood, Year, starts_with("prop_edu_"))
+
+# Join with inspections data
+inspections_with_demographics <- inspections_with_demographics %>%
+  left_join(
+    education_props,
+    by = c("COMMUNITY" = "Neighborhood", "Year" = "Year"))
+
+
+```
+
+# Adding in Poverty Data by Community Area per Year
+```{r}
+poverty_data <- read.csv("data/CA-Poverty.csv", check.names = FALSE)
+
+# Pivot longer and clean up
+poverty_long <- poverty_data %>%
+  mutate(
+    Neighborhood = str_trim(Neighborhood),
+    Poverty = str_trim(Poverty)) %>%
+  pivot_longer(
+    cols = matches("^\\d{4}$"),
+    names_to = "Year",
+    values_to = "population") %>%
+  mutate(
+    Year = as.numeric(Year),
+    population = as.numeric(gsub(",", "", as.character(population))))
+
+# Calculate poverty rate by neighborhood and year
+poverty_rate <- poverty_long %>%
+  group_by(Neighborhood, Year) %>%
+  summarize(
+    total_pop = first(population[Poverty == "Total"]),
+    below_poverty = first(population[Poverty == "Income below poverty level"]),
+    poverty_rate = below_poverty / total_pop,
+    .groups = "drop") %>%
+  filter(!is.na(poverty_rate)) %>%
+  select(Neighborhood, Year, poverty_rate) %>%
+  mutate(Neighborhood = toupper(Neighborhood))
+
+# Join with inspections data
+inspections_with_demographics <- inspections_with_demographics %>%
+  left_join(
+    poverty_rate,
+    by = c("COMMUNITY" = "Neighborhood", "Year" = "Year"))
+```
+
+# Adding in Health Insurance Data by Community Area per Year
+```{r}
+insurance_data <- read.csv("data/CA-Insurance.csv", check.names = FALSE)
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+# Pivot longer and clean up
+insurance_long <- insurance_data %>%
+  mutate(
+    Neighborhood = str_trim(Neighborhood),
+    `Health Insurance` = str_trim(`Health Insurance`)) %>%
+  pivot_longer(
+    cols = matches("^\\d{4}$"),
+    names_to = "Year",
+    values_to = "population") %>%
+  mutate(
+    Year = as.numeric(Year),
+    population = as.numeric(gsub(",", "", as.character(population))))
+
+# Calculate insured rate by neighborhood and year
+insurance_rate <- insurance_long %>%
+  group_by(Neighborhood, Year) %>%
+  summarize(
+    total_pop = first(population[`Health Insurance` == "Total"]),
+    insured = first(population[`Health Insurance` == "Insured"]),
+    pct_insured = insured / total_pop,
+    .groups = "drop") %>%
+  filter(!is.na(pct_insured)) %>%
+  select(Neighborhood, Year, pct_insured) %>%
+  mutate(Neighborhood = toupper(Neighborhood))
+
+# Join with inspections data
+inspections_with_demographics <- inspections_with_demographics %>%
+  left_join(
+    insurance_rate,
+    by = c("COMMUNITY" = "Neighborhood", "Year" = "Year"))
+```
+
+# Visualizations with Demographics
+```{r}
+# Failure proportion by neighborhood
+neighborhood_summary <- inspections_with_demographics %>%
+  group_by(COMMUNITY) %>%
+  summarize(
+    failure_rate = mean(Results == "Fail", na.rm = TRUE),
+    prop_Black = mean(prop_Black, na.rm = TRUE),
+    prop_Hispanic = mean(prop_Latino, na.rm = TRUE),
+    prop_White = mean(prop_White, na.rm = TRUE),
+    prop_Asian = mean(prop_Asian, na.rm = TRUE),
+    poverty_rate = mean(poverty_rate, na.rm = TRUE),
+    pct_insured = mean(pct_insured, na.rm = TRUE),
+    pct_foreign_born = mean(pct_foreign_born, na.rm = TRUE),
+    prop_edu_no_hs = mean(prop_edu_no_hs, na.rm = TRUE),
+    prop_edu_ba_or_higher = mean(prop_edu_ba_or_higher, na.rm = TRUE),
+    n_inspections = n()) %>%
+  filter(n_inspections >= 10)  
+
+# Failure rate vs Poverty rate
+ggplot(neighborhood_summary, aes(x = poverty_rate, y = failure_rate)) +
+  geom_point(aes(size = n_inspections), alpha = 0.6) +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+  labs(
+    title = "Restaurant Failure Rate vs Poverty Rate by Neighborhood",
+    x = "Poverty Rate",
+    y = "Inspection Failure Rate",
+    size = "# Inspections") +
+  theme_minimal()
+
+# Failure rate vs Proportion Black
+ggplot(neighborhood_summary, aes(x = prop_Black, y = failure_rate)) +
+  geom_point(aes(size = n_inspections), alpha = 0.6) +
+  geom_smooth(method = "lm", se = TRUE, color = "blue") +
+  labs(
+    title = "Restaurant Failure Rate vs Proportion Black by Neighborhood",
+    x = "Proportion Black",
+    y = "Inspection Failure Rate",
+    size = "# Inspections") +
+  theme_minimal()
+
+# Failure rate vs Proportion Hispanic
+ggplot(neighborhood_summary, aes(x = prop_Hispanic, y = failure_rate)) +
+  geom_point(aes(size = n_inspections), alpha = 0.6) +
+  geom_smooth(method = "lm", se = TRUE, color = "green") +
+  labs(
+    title = "Restaurant Failure Rate vs Proportion Hispanic by Neighborhood",
+    x = "Proportion Hispanic",
+    y = "Inspection Failure Rate",
+    size = "# Inspections") +
+  theme_minimal()
+
+# Failure rate vs Education (No HS)
+ggplot(neighborhood_summary, aes(x = prop_edu_no_hs, y = failure_rate)) +
+  geom_point(aes(size = n_inspections), alpha = 0.6) +
+  geom_smooth(method = "lm", se = TRUE, color = "purple") +
+  labs(
+    title = "Restaurant Failure Rate vs Proportion No HS Diploma by Neighborhood",
+    x = "Proportion No HS Diploma",
+    y = "Inspection Failure Rate",
+    size = "# Inspections") +
+  theme_minimal()
+
+# Failure rate vs Insurance coverage
+ggplot(neighborhood_summary, aes(x = pct_insured, y = failure_rate)) +
+  geom_point(aes(size = n_inspections), alpha = 0.6) +
+  geom_smooth(method = "lm", se = TRUE, color = "orange") +
+  labs(
+    title = "Restaurant Failure Rate vs Insurance Coverage by Neighborhood",
+    x = "Percent Insured",
+    y = "Inspection Failure Rate",
+    size = "# Inspections") +
+  theme_minimal()
+
+# Correlation matrix for all variables
+library(corrplot)
+
+cor_data <- neighborhood_summary %>%
+  select(failure_rate, prop_Black, prop_Hispanic, prop_White, prop_Asian,
+         poverty_rate, pct_insured, pct_foreign_born, 
+         prop_edu_no_hs, prop_edu_ba_or_higher) %>%
+  na.omit()
+
+cor_matrix <- cor(cor_data)
+corrplot(cor_matrix, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45,
+         title = "Correlation Matrix: Failure Rate and Demographics",
+         mar = c(0,0,2,0))
+```
+
+# Adding in Past Failure Data
+```{r}
+# Calculate failure proportion by License for 2010-2019
+license_failure_rate <- inspections_with_demographics %>%
+  filter(Year >= 2010, Year <= 2019) %>%
+  group_by(License) %>%
+  summarize(
+    total_inspections_2010_2019 = n(),
+    failures_2010_2019 = sum(Results == "Fail", na.rm = TRUE),
+    failure_prop_2010_2019 = failures_2010_2019 / total_inspections_2010_2019,
+    .groups = "drop")
+
+# Join back to the main dataset
+inspections_with_demographics <- inspections_with_demographics %>%
+  left_join(
+    license_failure_rate,
+    by = "License")
+```
+
+# Add in Historical Weather Data
+```{r}
+weather_data <- read.csv("data/Chicago-Weather.csv")
+weather_data <- weather_data %>%
+  mutate(avg_temp = (TMAX + TMIN)/2,
+         spread = TMAX - TMIN)
+
+weather_data <- weather_data %>%
+  mutate(date = as.Date(DATE))
+
+weather_data <- weather_data %>%
+  mutate(
+    Year = year(ymd(date)),      
+    Month = month(ymd(date)),
+    Day = day(ymd(date)))
+
+weather_subset <- weather_data %>%
+  select(Year, Month, Day, avg_temp, precip = PRCP)
+
+inspections_full <- inspections_with_demographics %>%
+  left_join(
+    weather_subset,
+    by = c("Year", "Month", "Day"))
+```
+
+# Logistic Regression Predictive Modelling
+```{r}
+library(dplyr)
+library(caret)
+
+# PREPARE DATA
+model_data <- inspections_full %>%
+  filter(Results %in% c("Pass", "Fail")) %>%
+  mutate(outcome = factor(ifelse(Results == "Fail", "Fail", "Pass"), 
+                         levels = c("Pass", "Fail")))
+
+# Split: Train on 2010-2019, Test on 2020+
+train <- model_data %>% filter(Year <= 2019)
+test <- model_data %>% filter(Year >= 2020)
+
+cat("Train:", nrow(train), "rows\n")
+cat("Test:", nrow(test), "rows\n")
+
+
+# MODEL 1: Just temporal + weather
+m1 <- glm(outcome ~ Year + Month + Day + avg_temp + precip, 
+          data = train, family = binomial)
+
+m1_preds <- factor(ifelse(predict(m1, test, type = "response") > 0.5, "Fail", "Pass"),
+                   levels = c("Pass", "Fail"))
+
+cat("\n=== MODEL 1: Temporal + Weather ===\n")
+confusionMatrix(m1_preds, test$outcome, positive = "Fail")
+
+
+# MODEL 2: Add historical performance
+m2 <- glm(outcome ~ Year + Month + Day + avg_temp + precip + 
+            failure_prop_2010_2019, 
+          data = train, family = binomial)
+
+m2_preds <- factor(ifelse(predict(m2, test, type = "response") > 0.5, "Fail", "Pass"),
+                   levels = c("Pass", "Fail"))
+
+cat("\n=== MODEL 2: + Historical ===\n")
+confusionMatrix(m2_preds, test$outcome, positive = "Fail")
+
+
+# MODEL 3: Add socioeconomic
+m3 <- glm(outcome ~ Year + Month + Day + avg_temp + precip + 
+            failure_prop_2010_2019 +
+            poverty_rate + pct_insured + pct_foreign_born, 
+          data = train, family = binomial)
+
+m3_preds <- factor(ifelse(predict(m3, test, type = "response") > 0.5, "Fail", "Pass"),
+                   levels = c("Pass", "Fail"))
+
+cat("\n=== MODEL 3: + Socioeconomic ===\n")
+confusionMatrix(m3_preds, test$outcome, positive = "Fail")
+
+
+# MODEL 4: Add race
+m4 <- glm(outcome ~ Year + Month + Day + avg_temp + precip + 
+            failure_prop_2010_2019 +
+            poverty_rate + pct_insured + pct_foreign_born +
+            prop_Black + prop_Latino, 
+          data = train, family = binomial)
+
+m4_preds <- factor(ifelse(predict(m4, test, type = "response") > 0.5, "Fail", "Pass"),
+                   levels = c("Pass", "Fail"))
+
+cat("\n=== MODEL 4: + Race ===\n")
+confusionMatrix(m4_preds, test$outcome, positive = "Fail")
+
+
+# MODEL 5: Add education
+m5 <- glm(outcome ~ Year + Month + Day + avg_temp + precip + 
+            failure_prop_2010_2019 +
+            poverty_rate + pct_insured + pct_foreign_born +
+            prop_Black + prop_Latino +
+            prop_edu_ba_or_higher, 
+          data = train, family = binomial)
+
+m5_preds <- factor(ifelse(predict(m5, test, type = "response") > 0.5, "Fail", "Pass"),
+                   levels = c("Pass", "Fail"))
+
+cat("\n=== MODEL 5: + Education ===\n")
+confusionMatrix(m5_preds, test$outcome, positive = "Fail")
+
+```
