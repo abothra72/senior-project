@@ -7,7 +7,8 @@
   - Think about model: fit a simple one, do we want to do binary, do this before adding other data
   - Simple data visualizations
  
-- By Early March:
+- By Feb 27th:
+  -   Better visualizations for all the variables (think about clarity)
   -   Playing around with test and train data (balancing, removing COVID years?, etc.)
-  -   Trying machine learning (e.g. random forest) instead of just logistic regression
-  -   See which combinations of variables work better
+  -   Trying machine learning (e.g. random forest) instead of just logistic regression, see if you can find a package in R that is a metapackage for multiple ML methods
+  -   Think about feature importance & interpretability 
