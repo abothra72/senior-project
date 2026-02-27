@@ -23,6 +23,11 @@ library(sf)
 library(stringr)
 library(tidyr)
 library(ggplot2)
+library(scales)
+library(corrplot)
+library(viridis)
+library(caret)
+library(pROC)
 
 inspections <- read.csv("data/Chicago-Food-Inspections.csv")
 
@@ -621,3 +626,933 @@ cat("\n=== MODEL 5: + Education ===\n")
 confusionMatrix(m5_preds, test$outcome, positive = "Fail")
 
 ```
+
+# Temporal Visualizations:
+```{r}
+# Prepare data with proper dates
+inspections_full <- inspections_full %>%
+  mutate(Date = mdy(Inspection.Date))
+
+# Graph: Overall failure rate over time
+
+monthly_failure <- inspections_full %>%
+  filter(Results %in% c("Pass", "Fail")) %>%
+  mutate(YearMonth = floor_date(Date, "month")) %>%
+  group_by(YearMonth) %>%
+  summarise(
+    failure_rate = mean(Results == "Fail"),
+    n = n())
+
+ggplot(monthly_failure, aes(x = YearMonth, y = failure_rate)) +
+  geom_line(color = "blue", size = 1) +
+  geom_smooth(se = FALSE, color = "red", linetype = "dashed") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Restaurant Inspection Failure Rate Over Time",
+       subtitle = "(2010-2026)",
+       x = "Date",
+       y = "Failure Rate",
+       caption = "Red dashed line = trend") +
+  theme_minimal()
+
+# Graph: Failure rate by month
+
+monthly_seasonal <- inspections_full %>%
+  filter(Results %in% c("Pass", "Fail")) %>%
+  group_by(Month) %>%
+  summarise(
+    failure_rate = mean(Results == "Fail"),
+    n = n()) %>%
+  mutate(Month_Name = month.abb[Month])
+
+ggplot(monthly_seasonal, aes(x = factor(Month), y = failure_rate)) +
+  geom_col(fill = "blue", alpha = 0.8) +
+  scale_x_discrete(labels = month.abb) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Seasonal Pattern in Restaurant Failures",
+       subtitle = "Average failure rate by month (2010-2026)",
+       x = "Month",
+       y = "Failure Rate") +
+  theme_minimal()
+
+# Graph: Monthly failure rate faceted by year 
+
+monthly_by_year <- inspections_full %>%
+  filter(Results %in% c("Pass", "Fail"),
+         Year >= 2010, Year <= 2025) %>%
+  group_by(Year, Month) %>%
+  summarise(
+    failure_rate = mean(Results == "Fail"),
+    n = n()) %>%
+  ungroup()
+
+ggplot(monthly_by_year, aes(x = factor(Month), y = failure_rate)) +
+  geom_col(fill = "blue", alpha = 0.8) +
+  facet_wrap(~ Year, ncol = 4) +
+  scale_x_discrete(labels = month.abb) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Seasonal Patterns in Restaurant Failures by Year",
+       x = "Month",
+       y = "Failure Rate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
+
+# Graph: Failure rate year-over-year trend
+
+yearly_failure <- inspections_full %>%
+  filter(Results %in% c("Pass", "Fail"),
+         Year >= 2010, Year <= 2025) %>%
+  group_by(Year) %>%
+  summarise(
+    failure_rate = mean(Results == "Fail"),
+    n = n())
+
+ggplot(yearly_failure, aes(x = Year, y = failure_rate)) +
+  geom_line(color = "blue", size = 1.2) +
+  geom_point(size = 3, color = "blue") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_x_continuous(breaks = seq(2010, 2025, 2)) +
+  labs(title = "Annual Restaurant Failure Rate Trend",
+       subtitle = "2010-2025",
+       x = "Year",
+       y = "Failure Rate") +
+  theme_minimal()
+
+# Graph: Inspection volume by year
+
+ggplot(yearly_failure, aes(x = Year, y = n)) +
+  geom_col(fill = "blue", alpha = 0.8) +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_continuous(breaks = seq(2010, 2025, 2)) +
+  labs(title = "Number of Restaurant Inspections by Year",
+       subtitle = "2010-2025",
+       x = "Year",
+       y = "Number of Inspections") +
+  theme_minimal()
+```
+
+# Spatial and Demographic Visualizations
+```{r}
+# Graph: Worst 15 neighborhoods
+
+neighborhood_failure <- inspections_full %>%
+  filter(Results %in% c("Pass", "Fail"),
+         !is.na(COMMUNITY)) %>%
+  group_by(COMMUNITY) %>%
+  summarise(
+    failure_rate = mean(Results == "Fail"),
+    n_inspections = n(),
+    avg_poverty = mean(poverty_rate, na.rm = TRUE),
+    avg_prop_black = mean(prop_Black, na.rm = TRUE)) %>%
+  arrange(desc(failure_rate))
+
+ggplot(neighborhood_failure %>% head(15), 
+       aes(x = reorder(COMMUNITY, failure_rate), y = failure_rate)) +
+  geom_col(fill = "blue", alpha = 0.8) +
+  coord_flip() +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Top 15 Neighborhoods by Failure Rate",
+       subtitle = "Average from 2010-2026",
+       x = "Neighborhood",
+       y = "Failure Rate") +
+  theme_minimal()
+
+# Graph: Best 15 neighborhoods
+
+ggplot(neighborhood_failure %>% tail(15), 
+       aes(x = reorder(COMMUNITY, -failure_rate), y = failure_rate)) +
+  geom_col(fill = "darkgreen", alpha = 0.7) +
+  coord_flip() +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "15 Safest Neighborhoods by Failure Rate",
+       subtitle = "Average from 2010-2026",
+       x = "Neighborhood",
+       y = "Failure Rate") +
+  theme_minimal()
+
+# Graph: Inspection density by neighborhood
+
+ggplot(neighborhood_failure %>% arrange(desc(n_inspections)) %>% head(20),
+       aes(x = reorder(COMMUNITY, n_inspections), y = n_inspections)) +
+  geom_col(fill = "coral", alpha = 0.8) +
+  coord_flip() +
+  scale_y_continuous(labels = comma_format()) +
+  labs(title = "Top 20 Neighborhoods by Number of Inspections",
+       subtitle = "2010-2026",
+       x = "Neighborhood",
+       y = "Number of Inspections") +
+  theme_minimal()
+
+
+# Graph: Poverty vs Failure Rate
+
+ggplot(neighborhood_failure, aes(x = avg_poverty, y = failure_rate)) +
+  geom_point(aes(size = n_inspections), alpha = 0.6, color = "blue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red", linetype = "dashed") +
+  scale_x_continuous(labels = percent_format()) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Poverty Rate vs Restaurant Failure Rate by Neighborhood",
+      subtitle = "Average 2010-2026",
+       x = "Poverty Rate",
+       y = "Failure Rate",
+       size = "# Inspections") +
+  theme_minimal()
+
+# Correlation of poverty and failure rate
+cor_poverty <- cor(neighborhood_failure$avg_poverty, 
+                   neighborhood_failure$failure_rate, 
+                   use = "complete.obs")
+cat("Correlation (Poverty vs Failure):", round(cor_poverty, 3), "\n")
+
+
+# Graph: Education vs Failure Rate
+
+neighborhood_education <- inspections_full %>%
+  filter(Results %in% c("Pass", "Fail"),
+         !is.na(COMMUNITY)) %>%
+  group_by(COMMUNITY) %>%
+  summarise(
+    failure_rate = mean(Results == "Fail"),
+    avg_ba_or_higher = mean(prop_edu_ba_or_higher, na.rm = TRUE),
+    n_inspections = n())
+
+ggplot(neighborhood_education, aes(x = avg_ba_or_higher, y = failure_rate)) +
+  geom_point(aes(size = n_inspections), alpha = 0.6, color = "darkgreen") +
+  geom_smooth(method = "lm", se = FALSE, color = "red", linetype = "dashed") +
+  scale_x_continuous(labels = percent_format()) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Education Level vs Restaurant Failure Rate by Neighborhood",
+       subtitle = "Average 2010-2026",
+       x = "% Population with BA or Higher",
+       y = "Failure Rate",
+       size = "# Inspections") +
+  theme_minimal()
+
+# Correlation of education and failure rate
+cor_edu <- cor(neighborhood_education$avg_ba_or_higher, 
+               neighborhood_education$failure_rate, 
+               use = "complete.obs")
+cat("Correlation (Education vs Failure):", round(cor_edu, 3), "\n")
+
+# Graphs: Multiple Demographs vs Failure Rate
+
+demo_data <- inspections_full %>%
+  filter(Results %in% c("Pass", "Fail"),
+         !is.na(COMMUNITY)) %>%
+  group_by(COMMUNITY) %>%
+  summarise(
+    failure_rate = mean(Results == "Fail"),
+    poverty_rate = mean(poverty_rate, na.rm = TRUE),
+    prop_Black = mean(prop_Black, na.rm = TRUE),
+    prop_edu_no_hs = mean(prop_edu_no_hs, na.rm = TRUE),
+    pct_insured = mean(pct_insured, na.rm = TRUE),
+    n = n())
+
+demo_long <- demo_data %>%
+  pivot_longer(cols = c(poverty_rate, prop_Black, prop_edu_no_hs, pct_insured),
+               names_to = "demographic",
+               values_to = "value") %>%
+  mutate(demographic = recode(demographic,
+                              poverty_rate = "Poverty Rate",
+                              prop_Black = "% Black",
+                              prop_edu_no_hs = "% No High School",
+                              pct_insured = "% Insured"))
+
+ggplot(demo_long, aes(x = value, y = failure_rate)) +
+  geom_point(alpha = 0.5, color = "blue") +
+  geom_smooth(method = "lm", se = TRUE, color = "red", size = 0.8) +
+  facet_wrap(~ demographic, scales = "free_x", ncol = 2) +
+  scale_x_continuous(labels = percent_format()) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Demographic Factors vs Restaurant Failure Rate",
+       subtitle = "Average 2010-2026",
+       x = "Demographic Variable",
+       y = "Failure Rate") +
+  theme_minimal() +
+  theme(strip.text = element_text(face = "bold", size = 11))
+
+# Graph: Failure rate by neighborhoods according to majority race
+
+neighborhood_race_summary <- inspections_full %>%
+  filter(Results %in% c("Pass", "Fail"),
+         !is.na(COMMUNITY)) %>%
+  group_by(COMMUNITY) %>%
+  summarise(
+    failure_rate = mean(Results == "Fail"),
+    prop_White = mean(prop_White, na.rm = TRUE),
+    prop_Black = mean(prop_Black, na.rm = TRUE),
+    prop_Latino = mean(prop_Latino, na.rm = TRUE),
+    n_inspections = n()) %>%
+  mutate(majority_race = case_when(
+    prop_White > 0.5 ~ "Majority White",
+    prop_Black > 0.5 ~ "Majority Black",
+    prop_Latino > 0.5 ~ "Majority Latino",
+    TRUE ~ "Mixed/Other")) %>%
+  filter(majority_race != "Mixed/Other")
+
+ggplot(neighborhood_race_summary, aes(x = majority_race, y = failure_rate)) +
+  geom_boxplot(aes(fill = majority_race), alpha = 0.7) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Failure Rates by Neighborhood Racial Composition",
+       subtitle = "Average 2010-2026",
+       x = "Neighborhood Type",
+       y = "Failure Rate",
+       fill = "Majority Race") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Graph: Corrplot of demographics
+
+# Calculate correlations
+demo_corr_data <- inspections_full %>%
+  filter(!is.na(COMMUNITY)) %>%
+  group_by(COMMUNITY) %>%
+  summarise(
+    failure_rate = mean(Results == "Fail", na.rm = TRUE),
+    poverty = mean(poverty_rate, na.rm = TRUE),
+    pct_black = mean(prop_Black, na.rm = TRUE),
+    pct_latino = mean(prop_Latino, na.rm = TRUE),
+    pct_white = mean(prop_White, na.rm = TRUE),
+    no_hs = mean(prop_edu_no_hs, na.rm = TRUE),
+    ba_or_higher = mean(prop_edu_ba_or_higher, na.rm = TRUE),
+    insured = mean(pct_insured, na.rm = TRUE),
+    foreign_born = mean(pct_foreign_born, na.rm = TRUE)) %>%
+  select(-COMMUNITY) %>%
+  na.omit()
+
+corr_matrix <- cor(demo_corr_data)
+
+corrplot(corr_matrix, 
+         method = "color",
+         type = "upper",
+         tl.col = "black",
+         tl.srt = 45,
+         addCoef.col = "black",
+         number.cex = 0.7,
+         title = "Correlation Matrix: Demographics and Failure Rate",
+         mar = c(0,0,2,0))
+```
+
+# Weather, Risk, and Historical Performance Visualizations
+```{r}
+# Graph: Temperature vs Failure Rate
+
+temp_failure <- inspections_full %>%
+  filter(Results %in% c("Pass", "Fail"),
+         !is.na(avg_temp)) %>%
+  group_by(avg_temp) %>%
+  summarise(
+    failure_rate = mean(Results == "Fail"),
+    n = n()) %>%
+  filter(n > 50)  # Only temps with enough observations
+
+ggplot(temp_failure, aes(x = avg_temp, y = failure_rate)) +
+  geom_point(aes(size = n), alpha = 0.5, color = "blue") +
+  geom_smooth(method = "loess", se = FALSE, color = "red", size = 1.2) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Temperature vs Restaurant Failure Rate",
+       subtitle = "2010-2026",
+       x = "Average Daily Temperature (°F)",
+       y = "Failure Rate",
+       size = "# Inspections") +
+  theme_minimal()
+
+# Graph: Temperature bins
+
+temp_bins <- inspections_full %>%
+  filter(Results %in% c("Pass", "Fail"),
+         !is.na(avg_temp)) %>%
+  mutate(temp_category = cut(avg_temp, 
+                             breaks = c(-Inf, 32, 50, 70, 85, Inf),
+                             labels = c("Freezing (<32°F)", 
+                                       "Cold (32-50°F)", 
+                                       "Moderate (50-70°F)", 
+                                       "Warm (70-85°F)", 
+                                       "Hot (>85°F)"))) %>%
+  group_by(temp_category) %>%
+  summarise(
+    failure_rate = mean(Results == "Fail"),
+    n = n())
+
+ggplot(temp_bins, aes(x = temp_category, y = failure_rate)) +
+  geom_col(fill = "blue", alpha = 0.8) +
+  geom_text(aes(label = paste0(round(failure_rate*100, 1), "%")), 
+            vjust = -0.5, size = 4) +
+  scale_y_continuous(labels = percent_format(), 
+                     limits = c(0, max(temp_bins$failure_rate) * 1.1)) +
+  labs(title = "Failure Rate by Temperature Range",
+       subtitle = "2010-2026",
+       x = "Temperature Category",
+       y = "Failure Rate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Graph: Precipitation vs Failure Rate
+
+precip_failure <- inspections_full %>%
+  filter(Results %in% c("Pass", "Fail"),
+         !is.na(precip)) %>%
+  mutate(precip_category = cut(precip,
+                               breaks = c(-0.01, 0, 0.1, 0.5, Inf),
+                               labels = c("No Rain", 
+                                         "Light (<0.1 in)", 
+                                         "Moderate (0.1-0.5 in)", 
+                                         "Heavy (>0.5 in)"))) %>%
+  group_by(precip_category) %>%
+  summarise(
+    failure_rate = mean(Results == "Fail"),
+    n = n())
+
+ggplot(precip_failure, aes(x = precip_category, y = failure_rate)) +
+  geom_col(fill = "blue", alpha = 0.8) +
+  geom_text(aes(label = paste0(round(failure_rate*100, 1), "%")), 
+            vjust = -0.5, size = 4) +
+  scale_y_continuous(labels = percent_format(),
+                     limits = c(0, max(precip_failure$failure_rate) * 1.1)) +
+  labs(title = "Failure Rate by Precipitation Level",
+       subtitle = "2010-2026",
+       x = "Precipitation Category",
+       y = "Failure Rate") +
+  theme_minimal()
+
+# Graph: Number of past violations 2010-2019
+
+repeat_offenders <- inspections_full %>%
+  filter(!is.na(failures_2010_2019)) %>%
+  distinct(License, .keep_all = TRUE) %>%
+  mutate(failure_category = cut(failures_2010_2019,
+                                breaks = c(-1, 0, 1, 2, 3, Inf),
+                                labels = c("0 failures", 
+                                          "1 failure", 
+                                          "2 failures", 
+                                          "3 failures", 
+                                          "4+ failures"))) %>%
+  group_by(failure_category) %>%
+  summarise(n_restaurants = n()) %>%
+  mutate(percentage = n_restaurants / sum(n_restaurants))
+
+ggplot(repeat_offenders, aes(x = failure_category, y = n_restaurants)) +
+  geom_col(fill = "blue", alpha = 0.8) +
+  geom_text(aes(label = paste0(round(percentage*100, 1), "%")), 
+            vjust = -0.5, size = 4) +
+  scale_y_continuous(labels = comma_format()) +
+  labs(title = "Restaurant Failure History",
+       subtitle = "2010-2019",
+       x = "Number of Failures in 2010-2019",
+       y = "Number of Restaurants") +
+  theme_minimal()
+
+# Graph: Past vs Future performance scatter plot
+
+past_future <- inspections_full %>%
+  filter(Results %in% c("Pass", "Fail")) %>%
+  group_by(License) %>%
+  summarise(
+    # Historical (2010-2019)
+    n_inspections_2010_2019 = sum(Year >= 2010 & Year <= 2019),
+    failures_2010_2019 = sum(Year >= 2010 & Year <= 2019 & Results == "Fail"),
+    historical_rate = failures_2010_2019 / n_inspections_2010_2019,
+    
+    # Future (2020+)
+    n_inspections_2020_plus = sum(Year >= 2020),
+    failures_2020_plus = sum(Year >= 2020 & Results == "Fail"),
+    future_rate = failures_2020_plus / n_inspections_2020_plus) %>%
+  filter(n_inspections_2010_2019 >= 3,   # ← REQUIRE 3+ historical
+         n_inspections_2020_plus >= 3)    # ← REQUIRE 3+ future
+
+# Correlation 
+correlation <- cor(past_future$historical_rate, 
+                   past_future$future_rate,
+                   use = "complete.obs")
+cat("Correlation (history vs future):", round(correlation, 3), "\n")
+
+ggplot(past_future, aes(x = historical_rate, y = future_rate)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = "Historical vs Future Failure Rates",
+       subtitle = "For restaurants with 3+ inspections in both periods",
+       x = "Historical Failure Rate (2010-2019)",
+       y = "Future Failure Rate (2020-2026)") +
+  theme_minimal()
+
+# Graph: Failure rate by risk category
+
+risk_failure <- inspections_full %>%
+  filter(Results %in% c("Pass", "Fail"),
+         Risk %in% c("Risk 1 (High)", "Risk 2 (Medium)", "Risk 3 (Low)")) %>%
+  group_by(Risk) %>%
+  summarise(
+    failure_rate = mean(Results == "Fail"),
+    n = n())
+
+ggplot(risk_failure, aes(x = Risk, y = failure_rate)) +
+  geom_col(fill = "blue", alpha = 0.8) +
+  geom_text(aes(label = paste0(round(failure_rate*100, 1), "%")), 
+            vjust = -0.5, size = 4) +
+  scale_y_continuous(labels = percent_format(),
+                     limits = c(0, 0.35)) +
+  labs(title = "Failure Rate by Chicago Risk Classification",
+       subtitle = "2010-2026",
+       x = "Risk Category",
+       y = "Failure Rate") +
+  theme_minimal()
+
+# Graph: Failure rate by facility type
+
+facility_failure <- inspections_full %>%
+  filter(Results %in% c("Pass", "Fail"),
+         !is.na(Facility.Type)) %>%
+  group_by(Facility.Type) %>%
+  summarise(
+    failure_rate = mean(Results == "Fail"),
+    n = n()) %>%
+  filter(n >= 100) %>%  # Only types with enough data
+  arrange(desc(failure_rate)) %>%
+  head(15)
+
+ggplot(facility_failure, aes(x = reorder(Facility.Type, failure_rate), y = failure_rate)) +
+  geom_col(fill = "blue", alpha = 0.8) +
+  coord_flip() +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Failure Rate by Facility Type",
+       subtitle = "2010-2026",
+       x = "Facility Type",
+       y = "Failure Rate") +
+  theme_minimal()
+```
+
+# Inspection Type Visualizations
+```{r}
+# Graph: Inspection type counts
+
+inspection_types <- inspections_full %>%
+  group_by(Inspection.Type) %>%
+  summarise(n = n()) %>%
+  arrange(desc(n))
+
+ggplot(inspection_types, aes(x = reorder(Inspection.Type, n), y = n)) +
+  geom_col(fill = "blue", alpha = 0.8) +
+  coord_flip() +
+  scale_y_continuous(labels = comma_format()) +
+  labs(title = "Distribution of Inspection Types",
+       subtitle = "2010-2026",
+       x = "Inspection Type",
+       y = "Number of Inspections") +
+  theme_minimal()
+
+# Graph: Failure rate by inspection type
+
+inspection_type_failure <- inspections_full %>%
+  filter(Results %in% c("Pass", "Fail")) %>%
+  group_by(Inspection.Type) %>%
+  summarise(
+    failure_rate = mean(Results == "Fail"),
+    n = n()) %>%
+  filter(n >= 500) %>%  # Only types with enough data
+  arrange(desc(failure_rate)) %>%
+  head(10)
+
+ggplot(inspection_type_failure, aes(x = reorder(Inspection.Type, failure_rate), y = failure_rate)) +
+  geom_col(fill = "blue", alpha = 0.8) +
+  coord_flip() +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Failure Rate by Inspection Type",
+       subtitle = "2010-2026",
+       x = "Inspection Type",
+       y = "Failure Rate") +
+  theme_minimal()
+```
+
+# Choropleth Maps
+```{r}
+# Choropleth Map: Failure rate by neighborhood (all years)
+neighborhood_failure_rates <- inspections_full %>%
+  filter(Results %in% c("Pass", "Fail"),
+         !is.na(COMMUNITY)) %>%
+  group_by(COMMUNITY) %>%
+  summarise(
+    failure_rate = mean(Results == "Fail"),
+    n_inspections = n())
+
+neighborhoods_sf <- st_as_sf(neighborhoods, wkt = "the_geom", crs = 4326)
+
+chicago_map <- neighborhoods_sf %>%
+  left_join(neighborhood_failure_rates, by = "COMMUNITY")
+
+ggplot(chicago_map) +
+  geom_sf(aes(fill = failure_rate), color = "white", size = 0.3) +
+  scale_fill_viridis(option = "viridis", 
+                     labels = percent_format(),
+                     name = "Failure\nRate",
+                     na.value = "gray80") +
+  labs(title = "Restaurant Failure Rates by Chicago Neighborhood",
+       subtitle = "2010-2026") +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 10),
+        legend.position = "right")
+
+# Choropleth Map: Just 2024
+
+neighborhood_failure_2024 <- inspections_full %>%
+  filter(Results %in% c("Pass", "Fail"),
+         Year == 2024,
+         !is.na(COMMUNITY)) %>%
+  group_by(COMMUNITY) %>%
+  summarise(
+    failure_rate = mean(Results == "Fail"),
+    n_inspections = n())
+
+chicago_map_2024 <- neighborhoods_sf %>%
+  left_join(neighborhood_failure_2024, by = "COMMUNITY")
+
+ggplot(chicago_map_2024) +
+  geom_sf(aes(fill = failure_rate), color = "white", size = 0.3) +
+  scale_fill_viridis(option = "viridis", 
+                     labels = percent_format(),
+                     name = "Failure\nRate",
+                     na.value = "gray80") +
+  labs(title = "Restaurant Failure Rates by Chicago Neighborhood",
+       subtitle = "2024") +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 10),
+        legend.position = "right")
+
+# Chooropleth Map: Number of inspections (all years)
+
+chicago_map_inspections <- neighborhoods_sf %>%
+  left_join(neighborhood_failure_rates, by = "COMMUNITY")
+
+ggplot(chicago_map_inspections) +
+  geom_sf(aes(fill = n_inspections), color = "white", size = 0.3) +
+  scale_fill_viridis(option = "viridis", 
+                     labels = comma_format(),
+                     name = "# of\nInspections",
+                     na.value = "gray80") +
+  labs(title = "Inspection Density by Chicago Neighborhood",
+       subtitle = "2010-2026") +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 10),
+        legend.position = "right")
+
+# Choropleth Map: Inspections Per Restaurant (2024)
+inspection_intensity_2024 <- inspections_full %>%
+  filter(Year == 2024,
+         !is.na(COMMUNITY)) %>%
+  group_by(COMMUNITY) %>%
+  summarise(
+    n_inspections = n(),
+    n_restaurants = n_distinct(License),
+    inspections_per_restaurant = n_inspections / n_restaurants)
+
+neighborhoods_sf <- st_as_sf(neighborhoods, wkt = "the_geom", crs = 4326)
+
+chicago_map_intensity <- neighborhoods_sf %>%
+  left_join(inspection_intensity_2024, by = "COMMUNITY")
+
+ggplot(chicago_map_intensity) +
+  geom_sf(aes(fill = inspections_per_restaurant), color = "white", size = 0.3) +
+  scale_fill_viridis(option = "viridis", 
+                     name = "Inspections\nper Restaurant",
+                     na.value = "gray80") +
+  labs(title = "Inspection Intensity by Chicago Neighborhood (2024)",
+       subtitle = "Average number of inspections per restaurant | Darker = more frequent inspections") +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 10),
+        legend.position = "right")
+```
+
+# Adding 2019-2023 Historical Variable
+```{r}
+# Calculate failure rate 2019-2023 for each restaurant
+historical_2019_2023 <- inspections_full %>%
+  filter(Year >= 2019, Year <= 2023,
+         Results %in% c("Pass", "Fail")) %>%
+  group_by(License) %>%
+  summarise(
+    total_inspections_2019_2023 = n(),
+    failures_2019_2023 = sum(Results == "Fail"),
+    failure_prop_2019_2023 = failures_2019_2023 / total_inspections_2019_2023)
+
+# Join with main data
+inspections_full <- inspections_full %>%
+  left_join(historical_2019_2023, by = "License")
+```
+
+# Adding 2021-2023 Historical Variable
+```{r}
+# Calculate failure rate 2021-2023 for each restaurant
+historical_2021_2023 <- inspections_full %>%
+  filter(Year >= 2021, Year <= 2023,
+         Results %in% c("Pass", "Fail")) %>%
+  group_by(License) %>%
+  summarise(
+    total_inspections_2021_2023 = n(),
+    failures_2021_2023 = sum(Results == "Fail"),
+    failure_prop_2021_2023 = failures_2021_2023 / total_inspections_2021_2023)
+
+# Join with main data
+inspections_full <- inspections_full %>%
+  left_join(historical_2021_2023, by = "License")
+
+```
+
+# Data Prep and Split
+```{r}
+
+
+# Filter to 2021+ data and create outcome
+model_data <- inspections_full %>%
+  filter(Year >= 2021,
+         Results %in% c("Pass", "Fail"),
+         !is.na(failure_prop_2021_2023)) %>%
+  mutate(outcome = factor(ifelse(Results == "Fail", "Fail", "Pass"),
+                         levels = c("Pass", "Fail"))) %>%
+  select(outcome, Year, Month, avg_temp, poverty_rate, pct_insured,
+         prop_Black, prop_edu_ba_or_higher, failure_prop_2021_2023) %>%
+  na.omit()
+
+# Convert factors
+model_data$Risk <- factor(model_data$Risk)
+model_data$Facility.Type <- factor(model_data$Facility.Type)
+
+cat("Total data after filtering:", nrow(model_data), "rows\n")
+cat("Pass:", sum(model_data$outcome == "Pass"), "\n")
+cat("Fail:", sum(model_data$outcome == "Fail"), "\n\n")
+
+# Test and Train Split
+train <- model_data %>% filter(Year >= 2021, Year <= 2023)
+test <- model_data %>% filter(Year >= 2024)
+
+cat("Training set (2021-2023):", nrow(train), "rows\n")
+cat("  Pass:", sum(train$outcome == "Pass"), "\n")
+cat("  Fail:", sum(train$outcome == "Fail"), "\n\n")
+
+cat("Test set (2024+):", nrow(test), "rows\n")
+cat("  Pass:", sum(test$outcome == "Pass"), "\n")
+cat("  Fail:", sum(test$outcome == "Fail"), "\n\n")
+```
+# Training Data Setup
+```{r}
+# Training Control Setup
+train_control <- trainControl(
+  method = "cv",                      # Cross-validation
+  number = 5,                         # 5-fold CV
+  classProbs = TRUE,                  # Get probabilities (needed for ROC)
+  summaryFunction = twoClassSummary,  # Calculate ROC, Sensitivity, Specificity
+  sampling = "down",                  # ← BALANCING HAPPENS HERE (downsample Pass)
+  savePredictions = "final",          # Save predictions for analysis
+  verboseIter = TRUE)                 # Show progress
+```
+# Training Models
+```{r}
+library(randomForest)
+library(gbm)
+
+# Train Models
+
+cat("\n=== TRAINING MODELS ===\n\n")
+
+
+# Model 1: Logistic Regression
+
+cat("Training Logistic Regression...\n")
+
+model_glm <- train(
+  outcome ~ .-Year,
+  data = train,
+  method = "glm",
+  family = "binomial",
+  trControl = train_control,
+  metric = "ROC")
+
+cat("  ✓ Logistic Regression complete\n")
+cat("  Cross-validated AUC:", round(max(model_glm$results$ROC), 3), "\n\n")
+
+
+# Model 2: Random Forest
+
+cat("Training Random Forest...\n")
+
+model_rf <- train(
+  outcome ~ .-Year,
+  data = train,
+  method = "rf",
+  trControl = train_control,
+  metric = "ROC",
+  ntree = 100,
+  importance = TRUE)
+
+cat("  ✓ Random Forest complete\n")
+cat("  Cross-validated AUC:", round(max(model_rf$results$ROC), 3), "\n\n")
+
+
+# Model 3: Gradient Boosting Machine
+
+cat("Training Gradient Boosting Machine...\n")
+
+model_gbm <- train(
+  outcome ~ .-Year,
+  data = train,
+  method = "gbm",
+  trControl = train_control,
+  metric = "ROC",
+  verbose = FALSE)
+
+cat("  ✓ GBM complete\n")
+cat("  Cross-validated AUC:", round(max(model_gbm$results$ROC), 3), "\n\n")
+
+
+# Model 4: K-Nearest Neighbors
+
+cat("Training KNN...\n")
+
+model_knn <- train(
+  outcome ~ .-Year,
+  data = train,
+  method = "knn",
+  trControl = train_control,
+  metric = "ROC",
+  tuneLength = 5,
+  preProcess = c("center", "scale"))
+
+cat("  ✓ KNN complete\n")
+cat("  Cross-validated AUC:", round(max(model_knn$results$ROC), 3), "\n\n")
+
+# Summary
+
+cat("=== ALL MODELS TRAINED ===\n\n")
+
+cat("Cross-Validation Results (on training data):\n")
+cat("  Logistic Regression:", round(max(model_glm$results$ROC), 3), "\n")
+cat("  Random Forest:      ", round(max(model_rf$results$ROC), 3), "\n")
+cat("  Gradient Boosting:  ", round(max(model_gbm$results$ROC), 3), "\n")
+cat("  KNN:                ", round(max(model_knn$results$ROC), 3), "\n")
+```
+
+# Evaluating on Test Set
+```{r}
+# Predicting on Test Set
+
+cat("\n=== GENERATING PREDICTIONS ON TEST SET ===\n\n")
+
+# Get probabilities for each model
+pred_glm_prob <- predict(model_glm, test, type = "prob")[,"Fail"]
+pred_rf_prob <- predict(model_rf, test, type = "prob")[,"Fail"]
+pred_gbm_prob <- predict(model_gbm, test, type = "prob")[,"Fail"]
+pred_knn_prob <- predict(model_knn, test, type = "prob")[,"Fail"]
+
+cat("Probabilities generated for all models\n\n")
+
+# Get class predictions at default threshold (0.5)
+pred_glm_class <- predict(model_glm, test)
+pred_rf_class <- predict(model_rf, test)
+pred_gbm_class <- predict(model_gbm, test)
+pred_knn_class <- predict(model_knn, test)
+
+cat("Class predictions generated at threshold = 0.5\n\n")
+
+# ROC and AUC
+
+roc_glm <- roc(test$outcome, pred_glm_prob, levels = c("Pass", "Fail"))
+roc_rf <- roc(test$outcome, pred_rf_prob, levels = c("Pass", "Fail"))
+roc_gbm <- roc(test$outcome, pred_gbm_prob, levels = c("Pass", "Fail"))
+roc_knn <- roc(test$outcome, pred_knn_prob, levels = c("Pass", "Fail"))
+
+cat("=== TEST SET PERFORMANCE (AUC) ===\n\n")
+cat("  Logistic Regression:", round(auc(roc_glm), 3), "\n")
+cat("  Random Forest:      ", round(auc(roc_rf), 3), "\n")
+cat("  Gradient Boosting:  ", round(auc(roc_gbm), 3), "\n")
+cat("  KNN:                ", round(auc(roc_knn), 3), "\n\n")
+
+# Plotting ROC curves together
+
+plot(roc_glm, col = "blue", lwd = 2, 
+     main = "ROC Curves: Model Comparison (Test Set)")
+plot(roc_rf, col = "red", lwd = 2, add = TRUE)
+plot(roc_gbm, col = "darkgreen", lwd = 2, add = TRUE)
+plot(roc_knn, col = "purple", lwd = 2, add = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+legend("bottomright", 
+       legend = c(
+         paste0("Logistic (AUC = ", round(auc(roc_glm), 3), ")"),
+         paste0("Random Forest (AUC = ", round(auc(roc_rf), 3), ")"),
+         paste0("GBM (AUC = ", round(auc(roc_gbm), 3), ")"),
+         paste0("KNN (AUC = ", round(auc(roc_knn), 3), ")")),
+       col = c("blue", "red", "darkgreen", "purple"),
+       lwd = 2,
+       cex = 0.8)
+```
+
+# Feature Importance
+```{r}
+# GLM just as an example
+importance <- varImp(model_glm, scale = TRUE)
+plot(importance)
+```
+
+# More Metrics
+```{r}
+# Evaluating GLM further
+
+# Get predictions at threshold = 0.5
+pred_glm_prob <- predict(model_glm, test, type = "prob")[,"Fail"]
+pred_glm_class <- factor(ifelse(pred_glm_prob > 0.5, "Fail", "Pass"),
+                         levels = c("Pass", "Fail"))
+
+# Confusion matrix at default threshold
+cm <- confusionMatrix(pred_glm_class, test$outcome, positive = "Fail")
+
+cat("=== LOGISTIC REGRESSION PERFORMANCE (Threshold = 0.5) ===\n\n")
+print(cm)
+
+cat("\n\n=== KEY METRICS SUMMARY ===\n")
+cat("Accuracy:          ", round(cm$overall['Accuracy'], 3), "\n")
+cat("Sensitivity:       ", round(cm$byClass['Sensitivity'], 3), "\n")
+cat("Specificity:       ", round(cm$byClass['Specificity'], 3), "\n")
+cat("Precision (PPV):   ", round(cm$byClass['Precision'], 3), "\n")
+cat("NPV:               ", round(cm$byClass['Neg Pred Value'], 3), "\n")
+cat("Balanced Accuracy: ", round(cm$byClass['Balanced Accuracy'], 3), "\n")
+cat("F1 Score:          ", round(cm$byClass['F1'], 3), "\n")
+cat("AUC:               ", round(auc(roc_glm), 3), "\n\n")
+
+# Find optimal threshold
+roc_glm <- roc(test$outcome, pred_glm_prob, levels = c("Pass", "Fail"))
+
+coords_all <- coords(roc_glm, "all", ret = c("threshold", "sensitivity", "specificity", "precision"))
+
+# Find threshold maximizing sensitivity with specificity >= 0.5
+optimal <- coords_all %>%
+  filter(specificity >= 0.5) %>%
+  arrange(desc(sensitivity)) %>%
+  slice(1)
+
+cat("=== OPTIMAL THRESHOLD (Specificity >= 50%) ===\n")
+cat("Threshold:   ", round(optimal$threshold, 3), "\n")
+cat("Sensitivity: ", round(optimal$sensitivity, 3), "\n")
+cat("Specificity: ", round(optimal$specificity, 3), "\n")
+cat("Precision:   ", round(optimal$precision, 3), "\n\n")
+
+# Apply optimal threshold
+pred_glm_optimal <- factor(ifelse(pred_glm_prob > optimal$threshold, "Fail", "Pass"),
+                           levels = c("Pass", "Fail"))
+
+cm_optimal <- confusionMatrix(pred_glm_optimal, test$outcome, positive = "Fail")
+
+cat("=== LOGISTIC REGRESSION PERFORMANCE (Optimal Threshold) ===\n\n")
+print(cm_optimal)
+
+cat("\n\n=== COMPARISON ===\n")
+cat("Default (0.5):  Sensitivity =", round(cm$byClass['Sensitivity'], 3),
+    "| Precision =", round(cm$byClass['Precision'], 3), "\n")
+cat("Optimal (", round(optimal$threshold, 3), "): Sensitivity =", 
+    round(cm_optimal$byClass['Sensitivity'], 3),
+    "| Precision =", round(cm_optimal$byClass['Precision'], 3), "\n")
+```
+
+
+
